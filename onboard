@@ -1,0 +1,33 @@
+#!/bin/bash
+# par10sky bootstrap proxy — prompts for a GitHub PAT, then runs the real
+# bin/onboard from the *private* magictoken/par10sky-bootstrap repo.
+#
+# This file is intentionally tiny and public so the bootstrap one-liner on a
+# fresh Mac is short enough to survive paste-mangling. The actual bootstrap
+# logic and all secrets live in the private repo.
+#
+# Usage on a fresh Mac:
+#   bash <(curl -fsSL https://raw.githubusercontent.com/magictoken/p10b/main/onboard)
+#
+# How to get a PAT:
+#   https://github.com/settings/tokens/new?description=par10sky-bootstrap&scopes=repo
+#   30-day expiry is fine. See docs/BOOTSTRAP-PAT.md in the private repo for
+#   the full renewal procedure.
+set -euo pipefail
+
+# Read PAT from the user's terminal (not from stdin — which is this script
+# itself when invoked via `bash <(curl ...)`).
+printf 'GitHub PAT (input hidden): ' > /dev/tty
+IFS= read -rs GH_BOOTSTRAP_PAT < /dev/tty
+printf '\n' > /dev/tty
+
+if [ -z "${GH_BOOTSTRAP_PAT:-}" ]; then
+  echo "no PAT entered — aborting" >&2
+  exit 1
+fi
+export GH_BOOTSTRAP_PAT
+
+# Fetch and exec the real bin/onboard. Use the PAT for the fetch; export it
+# so Phase 0.4 inside bin/onboard can read it and report expiry.
+exec bash <(curl -fsSL -u "$GH_BOOTSTRAP_PAT:" \
+  https://raw.githubusercontent.com/magictoken/par10sky-bootstrap/main/bin/onboard)
