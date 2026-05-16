@@ -1,33 +1,64 @@
 #!/bin/bash
-# par10sky bootstrap proxy — prompts for a GitHub PAT, then runs the real
-# bin/onboard from the *private* magictoken/par10sky-bootstrap repo.
+# par10sky bootstrap proxy — prefers the gh CLI's keychain-stored OAuth token
+# so you don't have to manage a PAT after the first bootstrap on each laptop.
 #
 # This file is intentionally tiny and public so the bootstrap one-liner on a
-# fresh Mac is short enough to survive paste-mangling. The actual bootstrap
-# logic and all secrets live in the private repo.
+# fresh Mac is short enough to survive any paste-mangling. The actual
+# bootstrap logic and all secrets live in the private
+# magictoken/par10sky-bootstrap repo.
 #
 # Usage on a fresh Mac:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/magictoken/p10b/main/onboard)
 #
-# How to get a PAT:
-#   https://github.com/settings/tokens/new?description=par10sky-bootstrap&scopes=repo
-#   30-day expiry is fine. See docs/BOOTSTRAP-PAT.md in the private repo for
-#   the full renewal procedure.
+# Auth resolution order:
+#   1. `gh auth token` — used silently if gh is installed and authenticated
+#      against github.com with `repo` scope. Token lives in the macOS
+#      Keychain, encrypted by the OS. Survives reboots. Never written to a
+#      file we manage. After the first bootstrap on each laptop (Phase 5 of
+#      bin/onboard runs `gh auth login --web`), this path works on every
+#      subsequent re-run — zero PAT prompts.
+#   2. Interactive PAT prompt — for first-time bootstrap on a fresh laptop
+#      where gh isn't installed yet, or if the gh token doesn't have repo
+#      scope. Get a PAT at:
+#         https://github.com/settings/tokens/new?description=par10sky-bootstrap&scopes=repo
 set -euo pipefail
 
-# Read PAT from the user's terminal (not from stdin — which is this script
-# itself when invoked via `bash <(curl ...)`).
-printf 'GitHub PAT (input hidden): ' > /dev/tty
-IFS= read -rs GH_BOOTSTRAP_PAT < /dev/tty
-printf '\n' > /dev/tty
+URL='https://raw.githubusercontent.com/magictoken/par10sky-bootstrap/main/bin/onboard'
 
-if [ -z "${GH_BOOTSTRAP_PAT:-}" ]; then
-  echo "no PAT entered — aborting" >&2
-  exit 1
+token=""
+
+# Path 1: gh CLI's stored token. Free auth, no PAT to manage.
+if command -v gh >/dev/null 2>&1; then
+  candidate=$(gh auth token 2>/dev/null || echo "")
+  if [ -n "$candidate" ]; then
+    # Probe access — gh might be authenticated under an account that doesn't
+    # have access to this private repo, or the token might lack `repo` scope.
+    if curl -fsSI -u "$candidate:" "$URL" >/dev/null 2>&1; then
+      echo "Using gh CLI's stored OAuth token (no PAT prompt needed)" > /dev/tty
+      token="$candidate"
+    else
+      echo "gh CLI is authenticated but the token can't read this repo." > /dev/tty
+      echo "  (probably missing 'repo' scope or wrong github account)" > /dev/tty
+      echo "  Falling back to manual PAT entry." > /dev/tty
+    fi
+  fi
 fi
-export GH_BOOTSTRAP_PAT
 
-# Fetch and exec the real bin/onboard. Use the PAT for the fetch; export it
-# so Phase 0.4 inside bin/onboard can read it and report expiry.
-exec bash <(curl -fsSL -u "$GH_BOOTSTRAP_PAT:" \
-  https://raw.githubusercontent.com/magictoken/par10sky-bootstrap/main/bin/onboard)
+# Path 2: interactive PAT prompt. Used on fresh laptops before Phase 5
+# has had a chance to run gh auth login.
+if [ -z "$token" ]; then
+  printf 'GitHub PAT (input hidden): ' > /dev/tty
+  IFS= read -rs token < /dev/tty
+  printf '\n' > /dev/tty
+  if [ -z "$token" ]; then
+    echo "no PAT entered — aborting" >&2
+    exit 1
+  fi
+fi
+
+export GH_BOOTSTRAP_PAT="$token"
+
+# Fetch and exec the real bin/onboard. Export the token so Phase 0.4 inside
+# bin/onboard can read it and report expiry. (gh OAuth tokens typically have
+# no expiry, so the phase will say so when this path is used.)
+exec bash <(curl -fsSL -u "$token:" "$URL")
