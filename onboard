@@ -1,64 +1,194 @@
 #!/bin/bash
-# par10sky bootstrap proxy — prefers the gh CLI's keychain-stored OAuth token
-# so you don't have to manage a PAT after the first bootstrap on each laptop.
+# par10sky bootstrap proxy — GitHub OAuth Device Flow + macOS Keychain cache.
 #
-# This file is intentionally tiny and public so the bootstrap one-liner on a
-# fresh Mac is short enough to survive any paste-mangling. The actual
-# bootstrap logic and all secrets live in the private
-# magictoken/par10sky-bootstrap repo.
+# This file is public and tiny so the bootstrap one-liner is short enough to
+# survive any paste path. The real bootstrap logic lives in the private
+# magictoken/par10sky-bootstrap repo and is fetched after auth.
 #
-# Usage on a fresh Mac:
+# Usage on any Mac (fresh or re-run):
 #   bash <(curl -fsSL https://raw.githubusercontent.com/magictoken/p10b/main/onboard)
 #
-# Auth resolution order:
-#   1. `gh auth token` — used silently if gh is installed and authenticated
-#      against github.com with `repo` scope. Token lives in the macOS
-#      Keychain, encrypted by the OS. Survives reboots. Never written to a
-#      file we manage. After the first bootstrap on each laptop (Phase 5 of
-#      bin/onboard runs `gh auth login --web`), this path works on every
-#      subsequent re-run — zero PAT prompts.
-#   2. Interactive PAT prompt — for first-time bootstrap on a fresh laptop
-#      where gh isn't installed yet, or if the gh token doesn't have repo
-#      scope. Get a PAT at:
-#         https://github.com/settings/tokens/new?description=par10sky-bootstrap&scopes=repo
+# Auth model:
+#   - First time on a Mac: GitHub OAuth Device Flow. Browser opens to
+#     https://github.com/login/device with an 8-char code (XXXX-XXXX).
+#     User authorizes. Resulting access token is stored in the local
+#     macOS Keychain — encrypted by the OS, no file we manage, no PAT to
+#     remember or paste.
+#   - Re-runs on the same Mac: silent cache hit, zero prompts.
+#   - Token revoked at github.com/settings/applications: cached probe gets
+#     401 → cache auto-invalidated → device flow runs again.
+#   - OAuth App rotated (new client_id): see ROTATION section at bottom.
 set -euo pipefail
 
-URL='https://raw.githubusercontent.com/magictoken/par10sky-bootstrap/main/bin/onboard'
+# === CONFIG ==================================================================
 
-token=""
+# Client ID of the par10sky-bootstrap OAuth App. Public, safe to commit.
+# If this app gets deleted or rotated in GitHub UI, update this value and
+# push a new commit to magictoken/p10b — every laptop's next bootstrap run
+# will hit a 404 on the device-code endpoint, drop the (now-orphaned)
+# cached token via the probe fallback, and re-authorize against the new
+# client_id automatically.
+CLIENT_ID='Ov23liBdb87Dyk4NBevG'
 
-# Path 1: gh CLI's stored token. Free auth, no PAT to manage.
-if command -v gh >/dev/null 2>&1; then
-  candidate=$(gh auth token 2>/dev/null || echo "")
-  if [ -n "$candidate" ]; then
-    # Probe access — gh might be authenticated under an account that doesn't
-    # have access to this private repo, or the token might lack `repo` scope.
-    if curl -fsSI -u "$candidate:" "$URL" >/dev/null 2>&1; then
-      echo "Using gh CLI's stored OAuth token (no PAT prompt needed)" > /dev/tty
-      token="$candidate"
-    else
-      echo "gh CLI is authenticated but the token can't read this repo." > /dev/tty
-      echo "  (probably missing 'repo' scope or wrong github account)" > /dev/tty
-      echo "  Falling back to manual PAT entry." > /dev/tty
+SCOPE='repo'
+PRIVATE_URL='https://raw.githubusercontent.com/magictoken/par10sky-bootstrap/main/bin/onboard'
+KEYCHAIN_SERVICE='par10sky-bootstrap-oauth'
+
+# === HELPERS =================================================================
+
+tty_msg() { printf '%s\n' "$*" > /dev/tty; }
+
+read_cached() {
+  security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$USER" -w 2>/dev/null
+}
+
+cache_token() {
+  security add-generic-password \
+    -s "$KEYCHAIN_SERVICE" -a "$USER" -w "$1" -U \
+    -l "par10sky bootstrap OAuth token" \
+    -j "GitHub OAuth Device Flow token for fetching the private par10sky-bootstrap repo. Safe to delete; will re-flow on next run."
+}
+
+invalidate_cache() {
+  security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$USER" >/dev/null 2>&1 || true
+}
+
+probe_token() {
+  curl -fsSI -u "$1:" "$PRIVATE_URL" >/dev/null 2>&1
+}
+
+# Parse one field from a form-encoded response (k=v&k=v&...).
+form_field() {
+  printf '%s' "$1" | tr '&' '\n' | sed -n "s/^$2=//p" | head -1
+}
+
+# URL-decode (just the chars GitHub actually returns: : / -).
+url_decode() {
+  printf '%s' "$1" | sed 's/%3A/:/g; s/%2F/\//g; s/%2D/-/g'
+}
+
+# === DEVICE FLOW =============================================================
+
+do_device_flow() {
+  tty_msg ""
+  tty_msg "First-time setup on this Mac — authorizing with GitHub..."
+
+  local resp
+  resp=$(curl -fsS -X POST 'https://github.com/login/device/code' \
+    -d "client_id=$CLIENT_ID" -d "scope=$SCOPE")
+  if [ -z "$resp" ]; then
+    tty_msg "ERROR: empty response from GitHub device-code endpoint."
+    tty_msg "Check: 1) network, 2) client_id $CLIENT_ID still exists in OAuth Apps."
+    exit 1
+  fi
+
+  local device_code user_code verification_uri interval expires_in
+  device_code=$(form_field "$resp" device_code)
+  user_code=$(url_decode "$(form_field "$resp" user_code)")
+  verification_uri=$(url_decode "$(form_field "$resp" verification_uri)")
+  interval=$(form_field "$resp" interval)
+  expires_in=$(form_field "$resp" expires_in)
+
+  if [ -z "$device_code" ] || [ -z "$user_code" ]; then
+    tty_msg "ERROR: malformed device-code response:"
+    tty_msg "  $resp"
+    tty_msg "If 'error=incorrect_client_credentials', the OAuth App for client_id"
+    tty_msg "$CLIENT_ID has been deleted/rotated. Update magictoken/p10b/onboard."
+    exit 1
+  fi
+
+  tty_msg ""
+  tty_msg "  Opening browser in 3s to: $verification_uri"
+  tty_msg "  Enter this code: $user_code"
+  tty_msg "  (also copied to clipboard)"
+  tty_msg ""
+
+  printf '%s' "$user_code" | pbcopy 2>/dev/null || true
+  sleep 3
+  open "$verification_uri" 2>/dev/null || true
+
+  local sleep_for="${interval:-5}"
+  local deadline=$(($(date +%s) + ${expires_in:-900}))
+
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    sleep "$sleep_for"
+    local tok_resp
+    tok_resp=$(curl -fsS -X POST 'https://github.com/login/oauth/access_token' \
+      -d "client_id=$CLIENT_ID" -d "device_code=$device_code" \
+      -d 'grant_type=urn:ietf:params:oauth:grant-type:device_code' || echo "error=network_error")
+
+    local access_token error
+    access_token=$(form_field "$tok_resp" access_token)
+    error=$(form_field "$tok_resp" error)
+
+    if [ -n "$access_token" ]; then
+      tty_msg "  ✓ Authorized."
+      printf '%s' "$access_token"
+      return 0
     fi
+
+    case "$error" in
+      authorization_pending) ;;
+      slow_down) sleep_for=$((sleep_for + 5)) ;;
+      access_denied)
+        tty_msg "  ✗ Authorization denied."
+        exit 1 ;;
+      expired_token)
+        tty_msg "  ✗ Device code expired (15 min). Re-run the bootstrap command."
+        exit 1 ;;
+      network_error)
+        tty_msg "  ... transient network error, retrying"
+        ;;
+      *)
+        tty_msg "  ✗ Unexpected response from GitHub: $tok_resp"
+        exit 1 ;;
+    esac
+  done
+
+  tty_msg "  ✗ Timed out waiting for authorization."
+  exit 1
+}
+
+# === MAIN ====================================================================
+
+token="$(read_cached || true)"
+if [ -n "$token" ]; then
+  if probe_token "$token"; then
+    tty_msg "Using cached OAuth token from Keychain (no prompts)."
+  else
+    tty_msg "Cached token rejected — likely revoked at github.com/settings/applications."
+    tty_msg "Invalidating cache and re-authorizing..."
+    invalidate_cache
+    token=""
   fi
 fi
 
-# Path 2: interactive PAT prompt. Used on fresh laptops before Phase 5
-# has had a chance to run gh auth login.
 if [ -z "$token" ]; then
-  printf 'GitHub PAT (input hidden): ' > /dev/tty
-  IFS= read -rs token < /dev/tty
-  printf '\n' > /dev/tty
-  if [ -z "$token" ]; then
-    echo "no PAT entered — aborting" >&2
-    exit 1
-  fi
+  token="$(do_device_flow)"
+  cache_token "$token"
+  tty_msg "  Token cached in Keychain. Future re-runs on this Mac won't prompt."
 fi
 
 export GH_BOOTSTRAP_PAT="$token"
+exec bash <(curl -fsSL -u "$token:" "$PRIVATE_URL")
 
-# Fetch and exec the real bin/onboard. Export the token so Phase 0.4 inside
-# bin/onboard can read it and report expiry. (gh OAuth tokens typically have
-# no expiry, so the phase will say so when this path is used.)
-exec bash <(curl -fsSL -u "$token:" "$URL")
+# === ROTATION SCENARIOS ======================================================
+#
+# 1. User wants to forcibly re-authorize on this Mac:
+#      security delete-generic-password -s par10sky-bootstrap-oauth -a $USER
+#    Next bootstrap run will device-flow again.
+#
+# 2. User revokes the OAuth App authorization on github.com:
+#    Visit https://github.com/settings/applications → revoke par10sky-bootstrap.
+#    The cached token on each Mac will get 401 on next probe → auto-invalidated
+#    → device flow runs again (user clicks Authorize in browser).
+#
+# 3. OAuth App rotated (new client_id, or app deleted and recreated):
+#    Boris updates CLIENT_ID at the top of this file, commits + pushes to
+#    magictoken/p10b. Each laptop's next bootstrap will:
+#      - try the cached token (still works briefly against raw.gh until GitHub
+#        garbage-collects orphaned tokens, OR fails immediately depending on
+#        whether the old app was deleted vs. rotated)
+#      - if probe fails: device-flow with the new client_id → fresh token cached.
+#    Token expiry of orphaned tokens: when the OAuth App is deleted, all
+#    issued tokens are revoked server-side, so the probe will fail on next run.
