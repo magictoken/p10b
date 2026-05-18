@@ -98,6 +98,14 @@ do_device_flow() {
   fi
 
   tty_msg ""
+  tty_msg "  This is the FIRST of two GitHub authorizations during fresh-Mac onboarding:"
+  tty_msg "    [now]   Auth #1 (this one): the p10b proxy needs a short-lived token to fetch"
+  tty_msg "                                bin/onboard from the private magictoken/par10sky-bootstrap"
+  tty_msg "                                repo. Used once, then discarded."
+  tty_msg "    [later] Auth #2 (in bin/onboard Phase 5): persistent gh CLI credentials for clones,"
+  tty_msg "                                              PRs, fleet-keysync, and slash-command branch flows."
+  tty_msg "  Sign in with your personal GitHub account (a member of the magictoken org)."
+  tty_msg ""
   tty_msg "  Opening browser in 3s to: $verification_uri"
   tty_msg "  Enter this code: $user_code"
   tty_msg "  (also copied to clipboard)"
