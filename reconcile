@@ -1,0 +1,171 @@
+#!/bin/bash
+# par10sky reconcile proxy — GitHub OAuth Device Flow + macOS Keychain cache.
+#
+# Parallel to ./onboard but for *ongoing reconciliation* rather than fresh-Mac
+# setup. Fetches bin/fleet-bootstrap from the private repo (which reads this
+# host's profile.json and applies the encoded intent via fleet-deployment-switch).
+#
+# Usage on any host that's already been onboarded:
+#   bash <(curl -fsSL https://raw.githubusercontent.com/magictoken/p10b/main/reconcile)
+#
+# This is the single canonical entry point for routine fleet reconciliation —
+# replacing the practice of running one-off bin/fleet-deployment-switch
+# commands per host. Same auth + Keychain caching as ./onboard.
+#
+# Auth model:
+#   - Shares the same Keychain entry as onboard (KEYCHAIN_SERVICE below).
+#     If you've already run onboard on this Mac, reconcile is silent.
+#   - First time on a Mac that hasn't run onboard yet: GitHub OAuth Device Flow.
+#   - Token revoked / OAuth App rotated: same auto-recovery path as onboard.
+set -euo pipefail
+
+# === CONFIG ==================================================================
+
+# MUST match ./onboard's CLIENT_ID so the Keychain entry is shared and one
+# device-flow round suffices for both entry points.
+CLIENT_ID='Ov23liBdb87Dyk4NBevG'
+
+SCOPE='repo'
+PRIVATE_URL='https://raw.githubusercontent.com/magictoken/par10sky-bootstrap/main/bin/fleet-bootstrap'
+KEYCHAIN_SERVICE='par10sky-bootstrap-oauth'
+
+# === HELPERS =================================================================
+
+tty_msg() { printf '%s\n' "$*" > /dev/tty; }
+
+read_cached() {
+  security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$USER" -w 2>/dev/null
+}
+
+cache_token() {
+  security add-generic-password \
+    -s "$KEYCHAIN_SERVICE" -a "$USER" -w "$1" -U \
+    -l "par10sky bootstrap OAuth token" \
+    -j "GitHub OAuth Device Flow token for fetching the private par10sky-bootstrap repo. Safe to delete; will re-flow on next run."
+}
+
+invalidate_cache() {
+  security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$USER" >/dev/null 2>&1 || true
+}
+
+probe_token() {
+  curl -fsSI -u "$1:" "$PRIVATE_URL" >/dev/null 2>&1
+}
+
+form_field() {
+  printf '%s' "$1" | tr '&' '\n' | sed -n "s/^$2=//p" | head -1
+}
+
+url_decode() {
+  printf '%s' "$1" | sed 's/%3A/:/g; s/%2F/\//g; s/%2D/-/g'
+}
+
+# === DEVICE FLOW =============================================================
+
+do_device_flow() {
+  tty_msg ""
+  tty_msg "First-time setup on this Mac — authorizing with GitHub..."
+
+  local resp
+  resp=$(curl -fsS -X POST 'https://github.com/login/device/code' \
+    -d "client_id=$CLIENT_ID" -d "scope=$SCOPE")
+  if [ -z "$resp" ]; then
+    tty_msg "ERROR: empty response from GitHub device-code endpoint."
+    tty_msg "Check: 1) network, 2) client_id $CLIENT_ID still exists in OAuth Apps."
+    exit 1
+  fi
+
+  local device_code user_code verification_uri interval expires_in
+  device_code=$(form_field "$resp" device_code)
+  user_code=$(url_decode "$(form_field "$resp" user_code)")
+  verification_uri=$(url_decode "$(form_field "$resp" verification_uri)")
+  interval=$(form_field "$resp" interval)
+  expires_in=$(form_field "$resp" expires_in)
+
+  if [ -z "$device_code" ] || [ -z "$user_code" ]; then
+    tty_msg "ERROR: malformed device-code response:"
+    tty_msg "  $resp"
+    tty_msg "If 'error=incorrect_client_credentials', the OAuth App for client_id"
+    tty_msg "$CLIENT_ID has been deleted/rotated. Update magictoken/p10b/reconcile + onboard."
+    exit 1
+  fi
+
+  tty_msg ""
+  tty_msg "  The p10b proxy needs a token to fetch bin/fleet-bootstrap from the"
+  tty_msg "  private magictoken/par10sky-bootstrap repo. The token will be cached"
+  tty_msg "  in Keychain so future runs of reconcile (and onboard) are silent."
+  tty_msg "  Sign in with your personal GitHub account (a member of the magictoken org)."
+  tty_msg ""
+  tty_msg "  Opening browser in 3s to: $verification_uri"
+  tty_msg "  Enter this code: $user_code"
+  tty_msg "  (also copied to clipboard)"
+  tty_msg ""
+
+  printf '%s' "$user_code" | pbcopy 2>/dev/null || true
+  sleep 3
+  open "$verification_uri" 2>/dev/null || true
+
+  local sleep_for="${interval:-5}"
+  local deadline=$(($(date +%s) + ${expires_in:-900}))
+
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    sleep "$sleep_for"
+    local tok_resp
+    tok_resp=$(curl -fsS -X POST 'https://github.com/login/oauth/access_token' \
+      -d "client_id=$CLIENT_ID" -d "device_code=$device_code" \
+      -d 'grant_type=urn:ietf:params:oauth:grant-type:device_code' || echo "error=network_error")
+
+    local access_token error
+    access_token=$(form_field "$tok_resp" access_token)
+    error=$(form_field "$tok_resp" error)
+
+    if [ -n "$access_token" ]; then
+      tty_msg "  ✓ Authorized."
+      printf '%s' "$access_token"
+      return 0
+    fi
+
+    case "$error" in
+      authorization_pending) ;;
+      slow_down) sleep_for=$((sleep_for + 5)) ;;
+      access_denied)
+        tty_msg "  ✗ Authorization denied."
+        exit 1 ;;
+      expired_token)
+        tty_msg "  ✗ Device code expired (15 min). Re-run the reconcile command."
+        exit 1 ;;
+      network_error)
+        tty_msg "  ... transient network error, retrying"
+        ;;
+      *)
+        tty_msg "  ✗ Unexpected response from GitHub: $tok_resp"
+        exit 1 ;;
+    esac
+  done
+
+  tty_msg "  ✗ Timed out waiting for authorization."
+  exit 1
+}
+
+# === MAIN ====================================================================
+
+token="$(read_cached || true)"
+if [ -n "$token" ]; then
+  if probe_token "$token"; then
+    tty_msg "Using cached OAuth token from Keychain (no prompts)."
+  else
+    tty_msg "Cached token rejected — likely revoked at github.com/settings/applications."
+    tty_msg "Invalidating cache and re-authorizing..."
+    invalidate_cache
+    token=""
+  fi
+fi
+
+if [ -z "$token" ]; then
+  token="$(do_device_flow)"
+  cache_token "$token"
+  tty_msg "  Token cached in Keychain. Future re-runs on this Mac won't prompt."
+fi
+
+export GH_BOOTSTRAP_PAT="$token"
+exec bash <(curl -fsSL -u "$token:" "$PRIVATE_URL")
