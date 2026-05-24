@@ -38,6 +38,39 @@ KEYCHAIN_SERVICE='par10sky-bootstrap-oauth'
 
 tty_msg() { printf '%s\n' "$*" > /dev/tty; }
 
+# big_tty: print a short string (typically the 8-char OAuth user_code like
+# "ABCD-1234") inside a large bold-cyan Unicode box with letters spaced out,
+# written directly to /dev/tty so it's unmissable when the user is hunting
+# for what to paste at github.com/login/device. Identical rendering to
+# big_code() in par10sky-bootstrap/bin/onboard — this is the standalone
+# inline copy since p10b cannot depend on the private repo. Bash 3.2 safe
+# (explicit `${var}` braces avoid a UTF-8 byte-boundary parse bug when
+# concatenating `═` to an empty local variable).
+big_tty() {
+  local code="$1"
+  local spaced="" i ch
+  for (( i=0; i<${#code}; i++ )); do
+    ch="${code:$i:1}"
+    if [ -z "$spaced" ]; then spaced="$ch"; else spaced="$spaced $ch"; fi
+  done
+  # `>` `<` not `▶ ◀`: those wide arrows are sometimes double-cell-width
+  # in terminals, which throws off box alignment.
+  local content=">  $spaced  <"
+  local pad=5
+  local inner=$(( ${#content} + pad * 2 ))
+  local bar="" sp=""
+  for (( i=0; i<inner; i++ )); do bar="${bar}═"; sp="${sp} "; done
+  {
+    printf "\033[1;36m"
+    printf "╔%s╗\n" "$bar"
+    printf "║%s║\n" "$sp"
+    printf "║%*s%s%*s║\n" "$pad" "" "$content" "$pad" ""
+    printf "║%s║\n" "$sp"
+    printf "╚%s╝\n" "$bar"
+    printf "\033[0m"
+  } > /dev/tty
+}
+
 read_cached() {
   security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$USER" -w 2>/dev/null
 }
@@ -106,9 +139,10 @@ do_device_flow() {
   tty_msg "                                              PRs, fleet-keysync, and slash-command branch flows."
   tty_msg "  Sign in with your personal GitHub account (a member of the magictoken org)."
   tty_msg ""
-  tty_msg "  Opening browser in 3s to: $verification_uri"
-  tty_msg "  Enter this code: $user_code"
+  big_tty "$user_code"
+  tty_msg ""
   tty_msg "  (also copied to clipboard)"
+  tty_msg "  Opening browser in 3s to: $verification_uri"
   tty_msg ""
 
   printf '%s' "$user_code" | pbcopy 2>/dev/null || true
